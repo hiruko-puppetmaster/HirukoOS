@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: https://cdn.axionos.org/X6882/axion-2.9-NOESIS-20261030171524-OFFICIAL-CORE-X6882.zip
+        description: 'Direct download URL to base ROM zip'
         required: true
+        default: 'https://cdn.axionos.org/X6882/axion-2.9-NOESIS-20261030171524-OFFICIAL-CORE-X6882.zip'
         type: string
       release_tag:
         description: 'Release version tag (e.g., v1.0-HirukoOS)'
@@ -26,30 +27,58 @@ jobs:
       - name: Maximize Runner Disk Space
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: true
+          preinstalled-runtimes: true
           android: true
           dotnet: true
           haskell: true
           large-packages: true
           docker-images: true
-          swap-storage: true
+          swap-storage: false
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget unzip erofs-utils attr p7zip-full
-          
+          sudo apt-get install -y wget curl aria2 jq unzip erofs-utils attr p7zip-full
+
           wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
           tar -xf payload-dumper-go_1.2.2_linux_amd64.tar.gz
           sudo mv payload-dumper-go /usr/local/bin/
           rm payload-dumper-go_1.2.2_linux_amd64.tar.gz
 
       - name: Download Base ROM and Extract Payload
+        env:
+          INPUT_ROM_URL: ${{ github.event.inputs.rom_url }}
         run: |
-          wget -q --show-progress -O rom.zip "${{ github.event.inputs.rom_url }}"
+          ROM_URL="$INPUT_ROM_URL"
+          UA="Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0"
+
+          echo "Checking ROM URL: $ROM_URL"
+          HTTP_STATUS=$(curl -sIL -A "$UA" -e "https://axionos.org/" -o /dev/null -w "%{http_code}" "$ROM_URL" || true)
+          echo "HTTP Status: $HTTP_STATUS"
+
+          # If the timestamped build was superseded (HTTP 404), attempt to resolve the latest X6882 URL from AxionOS OTA registry
+          if [ "$HTTP_STATUS" -eq 404 ]; then
+            echo "::warning::Provided ROM URL returned 404. Querying AxionAOSP/official_devices for latest X6882 build..."
+            FALLBACK_URL=$(curl -sL "https://raw.githubusercontent.com/AxionAOSP/official_devices/main/api/downloads.json" | jq -r '.. | objects | select(.codename? == "X6882" or .device? == "X6882") | .url? // .download? // empty' | head -n 1)
+            if [ -n "$FALLBACK_URL" ] && [ "$FALLBACK_URL" != "null" ]; then
+              echo "Found updated X6882 ROM URL: $FALLBACK_URL"
+              ROM_URL="$FALLBACK_URL"
+            else
+              echo "::error::ROM URL returned HTTP 404 and no automatic fallback URL could be resolved. Please provide an updated ROM URL."
+              exit 1
+            fi
+          elif [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "::error::Download check failed with HTTP $HTTP_STATUS for $ROM_URL"
+            exit 1
+          fi
+
+          echo "Downloading ROM from: $ROM_URL"
+          aria2c -x 16 -s 16 --user-agent="$UA" --referer="https://axionos.org/" -o rom.zip "$ROM_URL" || \
+            curl -fL --retry 3 -A "$UA" -e "https://axionos.org/" -o rom.zip "$ROM_URL"
+
           unzip -q rom.zip payload.bin
           rm -f rom.zip
-          
+
           payload-dumper-go -o raw_imgs -p system,system_ext,product,vendor,vbmeta payload.bin
           rm -f payload.bin
 
@@ -80,7 +109,8 @@ jobs:
 
             # Edit all .prop files in-place via tee so SELinux xattrs and inodes stay intact
             sudo find "work/${part}" -name "*.prop" -type f | while read -r propfile; do
-              cp "$propfile" /tmp/prop.tmp
+              sudo cp "$propfile" /tmp/prop.tmp
+              sudo chown "$USER:$USER" /tmp/prop.tmp
 
               # 1. Change ROM Display Name and Version Strings to HirukoOS
               sed -i 's/^ro\.build\.display\.id=.*/ro.build.display.id=HirukoOS/g' /tmp/prop.tmp
