@@ -1,0 +1,143 @@
+name: Build and Release HirukoOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: https://cdn.axionos.org/X6882/axion-2.9-NOESIS-20261030171524-OFFICIAL-CORE-X6882.zip
+        required: true
+        type: string
+      release_tag:
+        description: 'Release version tag (e.g., v1.0-HirukoOS)'
+        required: true
+        default: 'v1.0-HirukoOS'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  mod-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Maximize Runner Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget unzip erofs-utils attr p7zip-full
+          
+          wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          tar -xf payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          sudo mv payload-dumper-go /usr/local/bin/
+          rm payload-dumper-go_1.2.2_linux_amd64.tar.gz
+
+      - name: Download Base ROM and Extract Payload
+        run: |
+          wget -q --show-progress -O rom.zip "${{ github.event.inputs.rom_url }}"
+          unzip -q rom.zip payload.bin
+          rm -f rom.zip
+          
+          payload-dumper-go -o raw_imgs -p system,system_ext,product,vendor,vbmeta payload.bin
+          rm -f payload.bin
+
+      - name: Mount, Modify Build Properties, and Rebuild EROFS
+        run: |
+          PARTITIONS=("system" "system_ext" "product" "vendor")
+          mkdir -p mnt work out
+
+          # Copy vbmeta if present for convenient flashing
+          if [ -f "raw_imgs/vbmeta.img" ]; then
+            mv "raw_imgs/vbmeta.img" "out/vbmeta.img"
+          fi
+
+          for part in "${PARTITIONS[@]}"; do
+            if [ ! -f "raw_imgs/${part}.img" ]; then
+              echo "Skipping ${part}.img (not found)"
+              continue
+            fi
+
+            echo "Processing ${part}.img..."
+            mkdir -p "mnt/${part}" "work/${part}"
+
+            # Mount read-only and copy with -a to preserve UID, GID, permissions, and SELinux xattrs
+            sudo mount -o loop,ro "raw_imgs/${part}.img" "mnt/${part}"
+            sudo cp -a "mnt/${part}/." "work/${part}/"
+            sudo umount "mnt/${part}"
+            rm -f "raw_imgs/${part}.img"
+
+            # Edit all .prop files in-place via tee so SELinux xattrs and inodes stay intact
+            sudo find "work/${part}" -name "*.prop" -type f | while read -r propfile; do
+              cp "$propfile" /tmp/prop.tmp
+
+              # 1. Change ROM Display Name and Version Strings to HirukoOS
+              sed -i 's/^ro\.build\.display\.id=.*/ro.build.display.id=HirukoOS/g' /tmp/prop.tmp
+              sed -i -E 's/^(ro\.[a-zA-Z0-9_-]*version)=.*/\1=HirukoOS/g' /tmp/prop.tmp
+              sed -i -E 's/^(ro\.[a-zA-Z0-9_-]+\.display\.version)=.*/\1=HirukoOS/g' /tmp/prop.tmp
+              sed -i -E 's/^(ro\.[a-zA-Z0-9_-]+\.build\.version)=.*/\1=HirukoOS/g' /tmp/prop.tmp
+
+              # 2. Remove Maintainer Name
+              sed -i -E 's/^(ro\.[a-zA-Z0-9_.-]*maintainer)=.*/\1=/g' /tmp/prop.tmp
+
+              # 3. Strip "Official" from Build/Release Types and Version Strings
+              sed -i -E 's/^(ro\.[a-zA-Z0-9_.-]*buildtype)=.*/\1=/g' /tmp/prop.tmp
+              sed -i -E 's/^(ro\.[a-zA-Z0-9_.-]*releasetype)=.*/\1=/g' /tmp/prop.tmp
+              sed -i -E 's/[-_ ]?OFFICIAL//gI' /tmp/prop.tmp
+
+              # Overwrite existing inode in-place to keep security.selinux intact
+              sudo tee "$propfile" < /tmp/prop.tmp > /dev/null
+              rm -f /tmp/prop.tmp
+            done
+
+            # Repack into compressed EROFS image
+            sudo mkfs.erofs -zlz4hc -T 1230768000 "out/${part}_hiruko.img" "work/${part}"
+            sudo rm -rf "work/${part}"
+
+            # Split image if it exceeds 1900 MB (GitHub Release 2 GiB per-file limit)
+            IMG_SIZE=$(stat -c%s "out/${part}_hiruko.img")
+            if [ "$IMG_SIZE" -gt 1992294400 ]; then
+              echo "${part}_hiruko.img exceeds 1.9GB, splitting into 1.8GB chunks..."
+              7z a -v1800m -mx0 "out/${part}_hiruko.img.7z" "out/${part}_hiruko.img"
+              sudo rm -f "out/${part}_hiruko.img"
+            fi
+          done
+
+          # Generate SHA-256 checksums for release verification
+          cd out && sha256sum * > SHA256SUMS.txt
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: "HirukoOS (${{ github.event.inputs.release_tag }})"
+          body: |
+            ### HirukoOS Automated Build
+            * **ROM Branding:** HirukoOS
+            * **Maintainer / Official Strings:** Stripped
+            * **Filesystem:** EROFS (`lz4hc`)
+
+            #### Fastbootd Flashing Instructions
+            ```bash
+            fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img
+            fastboot flash system system_hiruko.img
+            fastboot flash system_ext system_ext_hiruko.img
+            fastboot flash product product_hiruko.img
+            fastboot flash vendor vendor_hiruko.img
+            fastboot reboot
+            ```
+          files: out/*
+          draft: false
+          prerelease: false
+          overwrite_files: true
